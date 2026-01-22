@@ -2,7 +2,7 @@
 # ============================================================
 # run2.py — PoplarCrossOmicsModel Training Script
 # Purpose: Train the model with VAE, Adversarial, and MMD losses.
-#          Removes contrastive/ID parts and complex visualizations.
+#          Removes contrastive/ID parts and specific hardcoded paths.
 # ============================================================
 
 import os
@@ -21,13 +21,13 @@ from tqdm import tqdm
 import argparse
 import logging
 from datetime import datetime
-import json
 import gc
 
 # Import the modified model
 from model2 import PoplarCrossOmicsModel
 
 def clean_cuda_cache():
+    """Clear GPU memory cache."""
     torch.cuda.empty_cache()
     gc.collect()
 
@@ -50,24 +50,19 @@ class ModelConfig:
         self.dropout = 0.2
         self.use_norm = True
 
-        # Loss Weights (Contrastive and ID removed)
-        self.adv_weight = 0.05   # Adversarial loss weight
-        self.mmd_weight = 0.05   # MMD loss weight
+        # Loss Weights
+        self.adv_weight = 0.05   # Adversarial loss
+        self.mmd_weight = 0.05   # MMD loss
         self.adv_lambda = 1.0    # GRL lambda
 
         # Training Hyperparameters
-        self.learning_rate = 1e-3
         self.weight_decay = 1e-5
-        self.num_epochs = 100
         self.early_stopping_patience = 30
 
         # KL Annealing
         self.kl_beta_start = 0.0
         self.kl_beta_end = 0.01
         self.kl_warmup_epochs = 300
-
-        # Logging
-        self.log_detailed_metrics_every = 1
 
 class DataConfig:
     def __init__(self):
@@ -92,7 +87,7 @@ class MultiOmicsDataLoader:
     def parse_graph_data(self, data_dict):
         print("Parsing saved graph data...")
         if 'edge_info_list' not in data_dict:
-            raise ValueError("edge_info_list not found")
+            raise ValueError("edge_info_list not found in pickle file")
         edge_info_list = data_dict['edge_info_list']
 
         edges_info = []
@@ -117,10 +112,16 @@ class MultiOmicsDataLoader:
         }
 
     def load_omics_features(self):
-        print("Loading omics features...")
+        print("Loading omics features from CSV...")
         features = {}
         for feature_type in ['rna', 'methylation', 'snp']:
-            df = pd.read_csv(self.data_paths[feature_type], index_col=0)
+            path = self.data_paths.get(feature_type)
+            if not path or not os.path.exists(path):
+                print(f"Warning: {feature_type} path not found or empty.")
+                features[feature_type] = pd.DataFrame()
+                continue
+                
+            df = pd.read_csv(path, index_col=0)
             df.index = df.index.astype(str)
             features[feature_type] = df
             print(f"{feature_type.upper()} shape: {df.shape}")
@@ -132,9 +133,9 @@ class MultiOmicsDataLoader:
         
         # Get IDs from CSVs
         csv_ids = {
-            'RNA':  [str(idx) for idx in omics_features['rna'].index.tolist()],
-            'METH': [str(idx) for idx in omics_features['methylation'].index.tolist()],
-            'SNP':  [str(idx) for idx in omics_features['snp'].index.tolist()],
+            'RNA':  [str(idx) for idx in omics_features.get('rna', pd.DataFrame()).index.tolist()],
+            'METH': [str(idx) for idx in omics_features.get('methylation', pd.DataFrame()).index.tolist()],
+            'SNP':  [str(idx) for idx in omics_features.get('snp', pd.DataFrame()).index.tolist()],
         }
 
         # Unique nodes keeping CSV order
@@ -158,18 +159,19 @@ class MultiOmicsDataLoader:
         return str(id_str)
 
     def create_omics_data_dict(self, omics_features, mappings):
-        print("Creating omics data tensors...")
+        print("Converting omics data to tensors...")
         omics_to_node = {'rna': 'RNA', 'methylation': 'METH', 'snp': 'SNP'}
         omics_data_dict = {}
 
         for omics_type, node_type in omics_to_node.items():
             nodes = mappings['nodes_by_type'].get(node_type, [])
-            if not nodes:
+            omics_df = omics_features.get(omics_type, pd.DataFrame())
+            
+            if not nodes or omics_df.empty:
                 omics_data_dict[omics_type] = torch.empty(0, 1)
                 continue
 
             node_ids = [nid for _, nid in nodes]
-            omics_df = omics_features[omics_type]
             col_mean = omics_df.mean(axis=0).values.astype(np.float32)
             
             # Map clean IDs for fast lookup
@@ -189,7 +191,7 @@ class MultiOmicsDataLoader:
         return omics_data_dict
 
     def process_edges(self, graph_data, mappings):
-        print("Processing edges...")
+        print("Processing graph edges...")
         from collections import defaultdict
         
         # Create global index map
@@ -257,7 +259,7 @@ class MultiOmicsDataLoader:
         }
 
     def load_data(self):
-        print("Starting data load...")
+        print("Starting comprehensive data load...")
         final = {}
         
         # 1. Graph Structure
@@ -296,10 +298,10 @@ class GraphTrainer:
         self.scheduler = None
         self.train_losses = []
         
-        # Metrics storage (Cleaned up)
+        # Simplified metrics
         self.detailed_metrics = {
-            'total_loss': [], 'recon_loss': [], 'kl_loss': [], 
-            'mmd_loss': [], 'adv_loss': [], 'kl_beta': []
+            'epoch': [], 'total_loss': [], 'recon_loss': [], 
+            'kl_loss': [], 'mmd_loss': [], 'adv_loss': []
         }
         
         self.best_loss = float('inf')
@@ -318,7 +320,7 @@ class GraphTrainer:
         self.logger.info(f"Log started: {log_file}")
 
     def build_model(self, data):
-        self.logger.info("Building Model...")
+        self.logger.info("Building PoplarCrossOmicsModel...")
         self.model = PoplarCrossOmicsModel(
             source_params=self.config.source_params,
             node_type_mapping=self.config.node_type_mapping,
@@ -341,7 +343,7 @@ class GraphTrainer:
         self.model.train()
         device = self.device
 
-        # Move data to device
+        # Move data to GPU
         omics_data = {k: v.to(device, non_blocking=True) for k, v in data['omics_data_dict'].items()}
         edge_indices = {k: v.to(device, non_blocking=True) for k, v in data['edge_indices_dict'].items()}
         edge_weights = {k: v.to(device, non_blocking=True) for k, v in data['edge_weights_dict'].items()}
@@ -373,24 +375,23 @@ class GraphTrainer:
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
 
-        # Logging
-        if (epoch + 1) % self.config.log_detailed_metrics_every == 0:
-            self.detailed_metrics['total_loss'].append(total_loss.item())
-            self.detailed_metrics['recon_loss'].append(loss_dict['reconstruction_loss'].item())
-            self.detailed_metrics['kl_loss'].append(loss_dict['kl_loss'].item())
-            self.detailed_metrics['mmd_loss'].append(loss_dict['mmd_loss'].item())
-            self.detailed_metrics['adv_loss'].append(loss_dict['adv_loss'].item())
-            self.detailed_metrics['kl_beta'].append(self.model.compute_kl_beta(epoch))
+        # Log metrics (Record every epoch)
+        self.detailed_metrics['epoch'].append(epoch + 1)
+        self.detailed_metrics['total_loss'].append(total_loss.item())
+        self.detailed_metrics['recon_loss'].append(loss_dict['reconstruction_loss'].item())
+        self.detailed_metrics['kl_loss'].append(loss_dict['kl_loss'].item())
+        self.detailed_metrics['mmd_loss'].append(loss_dict['mmd_loss'].item())
+        self.detailed_metrics['adv_loss'].append(loss_dict['adv_loss'].item())
 
-            self.logger.info(f"Epoch {epoch+1} | Loss: {total_loss.item():.4f} | "
-                             f"Recon: {loss_dict['reconstruction_loss'].item():.4f} | "
-                             f"MMD: {loss_dict['mmd_loss'].item():.4f} | "
-                             f"Adv: {loss_dict['adv_loss'].item():.4f}")
+        self.logger.info(f"Epoch {epoch+1:03d} | Total: {total_loss.item():.4f} | "
+                         f"Recon: {loss_dict['reconstruction_loss'].item():.4f} | "
+                         f"MMD: {loss_dict['mmd_loss'].item():.4f} | "
+                         f"Adv: {loss_dict['adv_loss'].item():.4f}")
 
         return total_loss.item()
 
     def train(self, data):
-        self.logger.info("Starting Training...")
+        self.logger.info("Starting Training Loop...")
         pbar = tqdm(range(self.config.num_epochs))
         
         for epoch in pbar:
@@ -405,13 +406,13 @@ class GraphTrainer:
             else:
                 self.patience_counter += 1
                 if self.patience_counter >= self.config.early_stopping_patience:
-                    self.logger.info("Early stopping triggered.")
+                    self.logger.info(f"Early stopping triggered at epoch {epoch+1}.")
                     break
             
             pbar.set_description(f"Loss: {loss:.4f}")
 
         self.plot_training_curve()
-        self.logger.info("Training Completed.")
+        self.logger.info("Training Finished.")
 
     def save_model(self, path):
         ckpt = {
@@ -431,13 +432,14 @@ class GraphTrainer:
         plt.ylabel('Loss')
         plt.title('Training Loss Curve')
         plt.legend()
+        plt.grid(True)
         plt.savefig(os.path.join(self.output_dir, 'training_curve.png'))
         plt.close()
 
 # ============================== Preprocessing ==============================
 
 def preprocess_omics_data(data):
-    print("Preprocessing data (Normalization)...")
+    print("Normalizing omics features...")
     
     def standardize(tensor, dim, clip_percentile=None):
         if tensor.numel() == 0: return tensor
@@ -452,15 +454,15 @@ def preprocess_omics_data(data):
         std = torch.where(std < 1e-8, torch.ones_like(std), std)
         return torch.nan_to_num((x - mean) / std)
 
-    # RNA & SNP: Log1p + Row Norm
+    # RNA & SNP: Log1p + Normalize
     for k in ['rna', 'snp']:
-        raw = data['omics_data_dict'][k]
-        if raw.numel() > 0:
+        raw = data['omics_data_dict'].get(k)
+        if raw is not None and raw.numel() > 0:
             data['omics_data_dict'][k] = standardize(torch.log1p(raw), dim=1)
 
-    # Methylation: Logit + Clip + Col Norm
-    meth = data['omics_data_dict']['methylation']
-    if meth.numel() > 0:
+    # Methylation: Logit + Clip + Normalize
+    meth = data['omics_data_dict'].get('methylation')
+    if meth is not None and meth.numel() > 0:
         x = meth.clone()
         if x.max() > 1.05: x = x / 100.0
         x = torch.clamp(x, 1e-6, 1-1e-6)
@@ -472,58 +474,78 @@ def preprocess_omics_data(data):
 # ============================== Main ==============================
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--epochs', type=int, default=300)
-    parser.add_argument('--lr', type=float, default=1e-3)
+    # Use argparse for paths instead of hardcoding
+    parser = argparse.ArgumentParser(description="Train PoplarCrossOmics Model")
+    
+    # Basic settings
+    parser.add_argument('--gpu', type=int, default=0, help='GPU ID to use (default: 0)')
+    parser.add_argument('--epochs', type=int, default=300, help='Training epochs')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--out_dir', type=str, default='./result_output', help='Output directory')
+    
+    # Data paths (using relative paths as defaults)
+    parser.add_argument('--graph_path', type=str, default='./data/guide_graph_pruned.pkl', 
+                        help='Path to the graph structure pickle file')
+    parser.add_argument('--rna_path', type=str, default='./data/rna_matrix.csv', 
+                        help='Path to RNA expression CSV')
+    parser.add_argument('--meth_path', type=str, default='./data/methylation_matrix.csv', 
+                        help='Path to Methylation CSV')
+    parser.add_argument('--snp_path', type=str, default='./data/snp_matrix.csv', 
+                        help='Path to SNP matrix CSV')
+
     args = parser.parse_args()
 
-    # Paths
-    output_dir = "./result_output" # Modified relative path for safety
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Update these paths to your actual file locations
+    # Create paths dictionary
     data_paths = {
-        'graph': r"/home/nefu1000004427/cwh/pyHGT-master/graph/guide_graph_pruned.pkl",
-        'rna': r"/home/nefu1000004427/cwh/pyHGT-master/process/filtered_omics_genes/rna_common_genes_matrix.csv",
-        'methylation': r"/home/nefu1000004427/cwh/pyHGT-master/process/filtered_omics_genes/methylation_common_genes_matrix.csv",
-        'snp': r"/home/nefu1000004427/cwh/pyHGT-master/process/filtered_omics_genes/snp_common_genes_matrix.csv"
+        'graph': args.graph_path,
+        'rna': args.rna_path,
+        'methylation': args.meth_path,
+        'snp': args.snp_path
     }
-
-    # Device
+    
+    os.makedirs(args.out_dir, exist_ok=True)
+    
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() and args.gpu != -1 else 'cpu')
 
+    print(f"Running on device: {device}")
+    print(f"Output directory: {args.out_dir}")
+
     try:
-        # Load & Process
+        # 1. Load and Preprocess
         loader = MultiOmicsDataLoader(data_paths)
         data = loader.load_data()
         data = preprocess_omics_data(data)
         
-        # Config Update
+        # 2. Update Config
         config = ModelConfig()
         config.num_epochs = args.epochs
         config.learning_rate = args.lr
+        
+        # Update input dimensions based on loaded data
         for k, v in data['omics_data_dict'].items():
-            if v.numel() > 0: config.source_params[k]['input_dim'] = v.shape[1]
+            if v.numel() > 0: 
+                config.source_params[k]['input_dim'] = v.shape[1]
+                print(f"Updated input_dim for {k}: {v.shape[1]}")
 
-        # Train
-        trainer = GraphTrainer(config, device, output_dir)
+        # 3. Train
+        trainer = GraphTrainer(config, device, args.out_dir)
         trainer.build_model(data)
         trainer.train(data)
 
-        # Final Save (Simplified)
-        print("Saving final results...")
-        torch.save(trainer.model.state_dict(), os.path.join(output_dir, "final_model.pth"))
+        # 4. Save Results
+        print("Saving final model and logs...")
+        torch.save(trainer.model.state_dict(), os.path.join(args.out_dir, "final_model.pth"))
         
-        # Save training log to CSV
+        # Save logs to CSV
         df = pd.DataFrame(trainer.detailed_metrics)
-        df.to_csv(os.path.join(output_dir, "training_log.csv"), index=False)
+        df.to_csv(os.path.join(args.out_dir, "training_log.csv"), index=False)
 
-        print(f"Done. Results saved to {output_dir}")
+        print(f"Done. All results saved to {args.out_dir}")
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"CRITICAL ERROR: {e}")
         traceback.print_exc()
+        print("\nNote: Please check your data paths in the arguments or command line.")
 
 if __name__ == "__main__":
     main()
