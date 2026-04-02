@@ -1,76 +1,113 @@
-# -*- coding: utf-8 -*-
-# ============================================================
-# Poplar Cross-Omics: Signed-Relation HGT + VAE + MMD + Domain Adaptation
-# Removed: Contrastive Learning & Identity Identity Modules
-# ============================================================
 import math
 import logging
 from typing import Dict, Tuple, List, Optional
+from collections import defaultdict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Try importing scatter_softmax
 try:
     from torch_geometric.utils import softmax as pyg_softmax
 except Exception:
     pyg_softmax = None
 
-# ============================== Utils ==============================
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 def init_weights(m):
-    """Xavier initialization for linear layers."""
     if isinstance(m, (nn.Linear, nn.Embedding)):
         nn.init.xavier_uniform_(m.weight)
         if hasattr(m, "bias") and m.bias is not None:
             nn.init.zeros_(m.bias)
 
-# ============================== Losses ==============================
 
 class MMDLoss(nn.Module):
-    """
-    RFF approximated Linear Time MMD loss.
-    """
-    def __init__(self, sigmas: Optional[List[float]] = None, rff_dim: int = 512, seed: int = 42):
+    def __init__(self, 
+                 sigmas: Optional[List[float]] = None,
+                 rff_dim: int = 512,
+                 kernel_weight: float = 0.8,
+                 random_seed: int = 42):
         super().__init__()
-        if sigmas is None: sigmas = [1, 2, 4, 8, 16]
-        self.sigmas = torch.tensor(sigmas, dtype=torch.float32)
-        self.rff_dim = rff_dim
-        self.seed = seed
-        self.register_buffer("W", None, persistent=False)
-        self.register_buffer("B", None, persistent=False)
-        self._inited = False
+        if sigmas is None:
+            sigmas = [1, 2, 4, 8, 16]
+        self.sigmas = torch.tensor(sigmas, dtype=torch.float32, requires_grad=False)
+        self.sigma_weights = nn.Parameter(torch.ones_like(self.sigmas) / len(self.sigmas), requires_grad=True)
+        self.rff_dim = int(rff_dim)
+        self.kernel_weight = float(kernel_weight)
+        self.seed = int(random_seed)
 
-    def _init_params(self, in_dim, device):
+        self.symmetric_detach = True  
+        self.max_samples = None      
+
+        self.register_buffer("W", None, persistent=False)   # [S, d, D]
+        self.register_buffer("B", None, persistent=False)   # [S, D]
+        self.register_buffer("rff_scale", None, persistent=False)
+        self._inited = False
+        self._in_dim = None
+
+    def _maybe_init(self, in_dim: int, device, dtype):
+        if self._inited and self._in_dim == in_dim:
+
+            self.W = self.W.to(device=device, dtype=dtype)
+            self.B = self.B.to(device=device, dtype=dtype)
+            self.rff_scale = self.rff_scale.to(device=device, dtype=dtype)
+            return
+
         g = torch.Generator(device=device); g.manual_seed(self.seed)
+        S, D = self.sigmas.numel(), self.rff_dim
         W_list, B_list = [], []
-        for s in self.sigmas:
-            W_list.append(torch.randn(in_dim, self.rff_dim, generator=g, device=device) / float(s))
-            B_list.append(2.0 * math.pi * torch.rand(self.rff_dim, generator=g, device=device))
-        self.W = torch.stack(W_list) # [S, d, D]
-        self.B = torch.stack(B_list) # [S, D]
-        self._inited = True
+        for s in self.sigmas.tolist():
+            W_s = torch.randn(in_dim, D, generator=g, device=device, dtype=dtype) / float(s)
+            b_s = 2.0 * math.pi * torch.rand(D, generator=g, device=device, dtype=dtype)
+            W_list.append(W_s); B_list.append(b_s)
+        self.W = nn.Parameter(torch.stack(W_list, dim=0), requires_grad=False)  # [S,d,D]
+        self.B = nn.Parameter(torch.stack(B_list, dim=0), requires_grad=False)  # [S,D]
+        self.rff_scale = nn.Parameter(torch.tensor((2.0 / float(D)) ** 0.5, device=device, dtype=dtype),
+                                      requires_grad=False)
+        self._inited, self._in_dim = True, in_dim
+
+    @staticmethod
+    def _maybe_subsample(Z: torch.Tensor, k: Optional[int]) -> torch.Tensor:
+        if (k is None) or (Z.size(0) <= k):
+            return Z
+        idx = torch.randperm(Z.size(0), device=Z.device)[:k]
+        return Z.index_select(0, idx)
+
+    def _phi_mean(self, Z: torch.Tensor) -> torch.Tensor:
+        # Z: [N,d]; W: [S,d,D]; B: [S,D] -> [S,N,D] -> mean->[S,D]
+        Z1 = Z.unsqueeze(0)
+        proj = torch.matmul(Z1, self.W) + self.B.unsqueeze(1)  # [S,N,D]
+        phi = self.rff_scale * torch.cos(proj)                  # [S,N,D]
+        return phi.mean(dim=1)                                  # [S,D]
 
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        if x.numel() == 0 or y.numel() == 0: return torch.tensor(0.0, device=x.device)
-        
-        # Subsample for memory efficiency
-        if x.size(0) > 4000: x = x[torch.randperm(x.size(0))[:4000]]
-        if y.size(0) > 4000: y = y[torch.randperm(y.size(0))[:4000]]
+        if x.numel() == 0 or y.numel() == 0:
+            return torch.tensor(0.0, device=x.device if x.numel() else y.device)
+        x = self._maybe_subsample(x, self.max_samples)
+        y = self._maybe_subsample(y, self.max_samples)
 
-        if not self._inited: self._init_params(x.size(1), x.device)
-        
-        # RFF mapping
-        # x: [N, d], W: [S, d, D] -> [S, N, D]
-        z_x = torch.cos(torch.matmul(x, self.W.transpose(1, 2)) + self.B.unsqueeze(1)).mean(1)
-        z_y = torch.cos(torch.matmul(y, self.W.transpose(1, 2)) + self.B.unsqueeze(1)).mean(1)
-        
-        return ((z_x - z_y) ** 2).sum()
+        self._maybe_init(x.size(1), x.device, x.dtype)
+        w = F.softmax(self.sigma_weights, dim=0).to(device=x.device, dtype=x.dtype)  # [S]
 
-# ============================== Adversarial Domain Adaptation ==============================
+        mx = self._phi_mean(x)   # [S,D]
+        my = self._phi_mean(y)   # [S,D]
+
+        if self.symmetric_detach:
+            # ½(||mx - sg(my)||^2 + ||sg(mx) - my||^2)
+            d1 = (mx - my.detach()); d2 = (mx.detach() - my)
+            per_sigma = 0.5 * ((d1 * d1).sum(dim=1) + (d2 * d2).sum(dim=1))  # [S]
+        else:
+            diff = mx - my
+            per_sigma = (diff * diff).sum(dim=1)
+
+        mmd_core = (w * per_sigma).sum()
+        mmd = torch.clamp(self.kernel_weight * mmd_core, 0.0, 1e3)
+        return mmd,mmd_core
+    
 
 class _GRL(torch.autograd.Function):
-    """Gradient Reversal Layer."""
     @staticmethod
     def forward(ctx, x, lambd):
         ctx.lambd = lambd
@@ -89,102 +126,142 @@ class DomainAdversary(nn.Module):
     def forward(self, z: torch.Tensor, lambd: float = 1.0):
         return self.net(_GRL.apply(z, lambd))
 
-# ============================== HGT Encoder ==============================
-
 class WeightedHGTConv(nn.Module):
-    """
-    Heterogeneous Graph Transformer convolution with signed edge support.
-    """
     def __init__(self, in_dim, out_dim, num_types, num_edge_types, n_heads, dropout=0.2, use_norm=True):
         super().__init__()
+        assert out_dim % n_heads == 0
+        self.in_dim = in_dim
         self.out_dim = out_dim
+        self.num_types = num_types
+        self.num_edge_types = num_edge_types
         self.n_heads = n_heads
         self.d_k = out_dim // n_heads
-        self.num_types = num_types
 
-        # Linear projections
+        # type-specific projections
         self.q_linears = nn.ModuleList([nn.Linear(in_dim, out_dim) for _ in range(num_types)])
         self.k_linears = nn.ModuleList([nn.Linear(in_dim, out_dim) for _ in range(num_types)])
         self.v_linears = nn.ModuleList([nn.Linear(in_dim, out_dim) for _ in range(num_types)])
 
-        # Relation params
+        # relation gates [R, H, d_k]
         self.rel_q = nn.Parameter(torch.randn(num_edge_types, n_heads, self.d_k))
         self.rel_k = nn.Parameter(torch.randn(num_edge_types, n_heads, self.d_k))
         self.rel_v = nn.Parameter(torch.randn(num_edge_types, n_heads, self.d_k))
-        
-        # Sign parameters: -1 (inhibit), +1 (activate), -2 (neutral)
+        nn.init.xavier_uniform_(self.rel_q); nn.init.xavier_uniform_(self.rel_k); nn.init.xavier_uniform_(self.rel_v)
+
+
         neg = torch.full((n_heads, self.d_k), -1.0)
         pos = torch.full((n_heads, self.d_k), +1.0)
-        self.register_buffer("sign_k_fixed", torch.stack([neg, pos], dim=0)) 
+        self.register_buffer("sign_k_fixed", torch.stack([neg, pos], dim=0))  # (2, H, d_k)
         self.register_buffer("sign_v_fixed", torch.stack([neg.clone(), pos.clone()], dim=0))
-        self.sign_k_neutral = nn.Parameter(torch.ones(n_heads, self.d_k))
+
+        self.sign_k_neutral = nn.Parameter(torch.ones(n_heads, self.d_k))     # (H, d_k)
         self.sign_v_neutral = nn.Parameter(torch.ones(n_heads, self.d_k))
 
         self.rel_bias = nn.Parameter(torch.zeros(num_edge_types, n_heads))
+        self.dist_alpha = nn.Parameter(torch.tensor(0.0))
+        self.dist_tau   = nn.Parameter(torch.tensor(1e5))
+
         self.attn_drop = nn.Dropout(dropout)
-        
+        self.msg_drop  = nn.Dropout(dropout)
+
         self.skip = nn.Parameter(torch.ones(num_types))
         self.norms = nn.ModuleList([nn.LayerNorm(out_dim) if use_norm else nn.Identity() for _ in range(num_types)])
-        
-        self.apply(init_weights)
 
-    def forward(self, node_inp, node_type, edge_index, edge_type, edge_sign):
-        if edge_index is None or edge_index.numel() == 0: return node_inp
-        
+        # init proj
+        for ls in (self.q_linears, self.k_linears, self.v_linears):
+            for lin in ls:
+                nn.init.xavier_uniform_(lin.weight); nn.init.zeros_(lin.bias)
+
+    def forward(self,
+                node_inp: torch.Tensor,        
+                node_type: torch.Tensor,       
+                edge_index: Optional[torch.Tensor],  
+                edge_type: Optional[torch.Tensor],  
+                edge_weights: Optional[torch.Tensor] = None, 
+                edge_sign: Optional[torch.Tensor] = None,    
+                edge_distance: Optional[torch.Tensor] = None )-> torch.Tensor:
+      
+
         N = node_inp.size(0)
         device = node_inp.device
-        src, dst = edge_index
-        
-        # Prepare Q, K, V
+
+        if edge_index is None or edge_index.numel() == 0:
+            return node_inp
+
+        src = edge_index[0].to(device); dst = edge_index[1].to(device)
+        E = src.numel()
+        edge_type = edge_type.to(device)
+
+
+        if edge_sign is None:
+            edge_sign = torch.full((E,), -2, dtype=torch.long, device=device)
+        else:
+            edge_sign = edge_sign.to(device)
+
+            edge_sign = torch.where(edge_sign < -1, torch.full_like(edge_sign, -2),
+                                    torch.where(edge_sign == 0, torch.full_like(edge_sign, -2),
+                                                edge_sign.clamp(-1, 1)))
+
+        # Q/K/V by type
         Q = torch.zeros((N, self.out_dim), device=device)
         K = torch.zeros((N, self.out_dim), device=device)
         V = torch.zeros((N, self.out_dim), device=device)
-        
         for t in range(self.num_types):
             m = (node_type == t)
             if m.any():
                 Q[m] = self.q_linears[t](node_inp[m])
                 K[m] = self.k_linears[t](node_inp[m])
                 V[m] = self.v_linears[t](node_inp[m])
-        
         Q = Q.view(N, self.n_heads, self.d_k)
         K = K.view(N, self.n_heads, self.d_k)
         V = V.view(N, self.n_heads, self.d_k)
 
-        # Relation & Sign embedding
-        r_q = self.rel_q[edge_type]
-        r_k = self.rel_k[edge_type]
-        r_v = self.rel_v[edge_type]
-        
-        # Sign mapping: -1->0, 1->1, others->2
-        s_idx = torch.where(edge_sign == -1, torch.zeros_like(edge_sign),
-                            torch.where(edge_sign == 1, torch.ones_like(edge_sign), 
-                            torch.full_like(edge_sign, 2))).long()
-        
-        sign_k_all = torch.cat([self.sign_k_fixed, self.sign_k_neutral.unsqueeze(0)], dim=0)
-        sign_v_all = torch.cat([self.sign_v_fixed, self.sign_v_neutral.unsqueeze(0)], dim=0)
-        s_k = sign_k_all[s_idx]
-        s_v = sign_v_all[s_idx]
+        rel_q = self.rel_q[edge_type]  # [E,H,d]
+        rel_k = self.rel_k[edge_type]
+        rel_v = self.rel_v[edge_type]
 
-        # Attention
-        q_eff = Q[dst] * r_q
-        k_eff = K[src] * r_k * s_k
-        v_eff = V[src] * r_v * s_v
-        
-        scores = (q_eff * k_eff).sum(-1) / math.sqrt(self.d_k) + self.rel_bias[edge_type]
-        
+
+        sign_idx = torch.where(edge_sign == -1, torch.zeros_like(edge_sign),
+                               torch.where(edge_sign ==  1, torch.ones_like(edge_sign),
+                                           torch.full_like(edge_sign, 2)))
+
+        sign_k_all = torch.cat([self.sign_k_fixed, self.sign_k_neutral.unsqueeze(0)], dim=0)  
+        sign_v_all = torch.cat([self.sign_v_fixed, self.sign_v_neutral.unsqueeze(0)], dim=0)
+        s_k = sign_k_all[sign_idx]
+        s_v = sign_v_all[sign_idx]
+
+        q_eff = Q[dst] * rel_q
+        k_eff = K[src] * rel_k * s_k
+        v_eff = V[src] * rel_v * s_v
+
+        scores = (q_eff * k_eff).sum(-1) / math.sqrt(self.d_k)
+        scores = scores + self.rel_bias[edge_type]
+        if edge_distance is not None:
+            phi = self.dist_alpha * torch.exp(-edge_distance.to(device) / (self.dist_tau + 1e-9))
+            scores = scores + phi.unsqueeze(-1)
+
+        # softmax over incoming edges per dst per head
         if pyg_softmax is not None:
-            attn = pyg_softmax(scores.view(-1), dst.repeat_interleave(self.n_heads)).view(-1, self.n_heads)
+            attn = pyg_softmax(scores.view(-1), dst.repeat_interleave(self.n_heads)).view(E, self.n_heads)
         else:
-            # Fallback naive softmax (slow)
-            attn = torch.zeros_like(scores)
-            # Simplified for brevity; assumes pyg is installed usually
-        
-        msg = (v_eff * self.attn_drop(attn).unsqueeze(-1)).view(-1, self.out_dim)
+            attn = torch.empty_like(scores)
+            perm = torch.argsort(dst)
+            d_sorted, s_sorted = dst[perm], scores[perm]
+            cuts = torch.where(d_sorted[1:] != d_sorted[:-1])[0] + 1
+            starts = torch.cat([torch.tensor([0], device=device), cuts])
+            ends   = torch.cat([cuts, torch.tensor([E], device=device)])
+            for s, e in zip(starts.tolist(), ends.tolist()):
+                seg = s_sorted[s:e]
+                m = seg.max(dim=0, keepdim=True).values
+                es = torch.exp(seg - m); Z = es.sum(0, keepdim=True)
+                attn[perm[s:e]] = es / (Z + 1e-9)
+
+        attn = self.attn_drop(attn)
+        msg = (v_eff * attn.unsqueeze(-1)).view(E, self.out_dim)
+
         out = torch.zeros((N, self.out_dim), device=device)
         out.index_add_(0, dst, msg)
 
-        # Residual + Norm
         res = torch.zeros_like(out)
         for t in range(self.num_types):
             m = (node_type == t)
@@ -193,175 +270,326 @@ class WeightedHGTConv(nn.Module):
                 res[m] = self.norms[t](alpha * out[m] + (1 - alpha) * node_inp[m])
         return res
 
-# ============================== VAE Module ==============================
 
-def _build_mlp(in_dim, hidden_dims, out_dim, dropout=0.0):
+def _build_mlp(in_dim, hidden_dims, out_dim, dropout=0.0, last_act=False):
     layers = []
     d = in_dim
     for h in (hidden_dims or []):
-        layers += [nn.Linear(d, h), nn.ReLU(inplace=True), nn.Dropout(dropout)]
+        layers += [nn.Linear(d, h), nn.ReLU(inplace=True)]
+        if dropout and dropout > 0:
+            layers.append(nn.Dropout(dropout))
         d = h
     layers.append(nn.Linear(d, out_dim))
+    if last_act:
+        layers.append(nn.ReLU(inplace=True))
     return nn.Sequential(*layers)
 
 class GraphVAEWithHGT(nn.Module):
-    def __init__(self, source_params, node_type_mapping, num_edge_relations, 
-                 n_hid=64, n_heads=4, dropout=0.2, use_norm=True, hgt_layers=2):
+    def __init__(self,
+                 source_params: dict,
+                 node_type_mapping: dict,
+                 num_edge_relations: int,
+                 n_hid: int = 64,
+                 n_heads: int = 4,
+                 dropout: float = 0.2,
+                 use_norm: bool = True,
+                 hgt_layers: int = 2  
+                 ):
         super().__init__()
         self.n_hid = n_hid
-        self.type_ids = {k.lower(): v for k, v in node_type_mapping.items()}
-        
-        # Encoders
+        self.n_heads = n_heads
+        self.dropout = dropout
+        self.use_norm = use_norm
+        self.hgt_layers = hgt_layers  
+        self.node_type_mapping = dict(node_type_mapping)
+        self.type_ids = {
+            "rna":  self.node_type_mapping["RNA"],
+            "methylation": self.node_type_mapping["METH"],
+            "snp":  self.node_type_mapping["SNP"],
+        }
+
+
         self.encoders = nn.ModuleDict()
-        for k in ["rna", "methylation", "snp"]:
-            sp = source_params[k]
-            self.encoders[k] = _build_mlp(sp["input_dim"], sp.get("hidden_dims", []), n_hid, dropout)
+        for omics_key in ["rna", "methylation", "snp"]:
+            sp = source_params[omics_key]
+            in_dim = int(sp["input_dim"])
+            hid = list(sp.get("hidden_dims", []))
+            self.encoders[omics_key] = _build_mlp(
+                in_dim=in_dim,
+                hidden_dims=hid,
+                out_dim=n_hid,  
+                dropout=dropout,
+                last_act=False
+            )
 
-        # HGT Layers
-        self.hgt_layers = nn.ModuleList([
-            WeightedHGTConv(n_hid, n_hid, len(node_type_mapping), num_edge_relations, n_heads, dropout, use_norm)
-            for _ in range(hgt_layers)
-        ])
 
-        # VAE Head
-        self.to_mu = nn.Linear(n_hid, n_hid)
+        self.hgt_layers_list = nn.ModuleList()
+        for _ in range(self.hgt_layers):
+            self.hgt_layers_list.append(
+                WeightedHGTConv(
+                    in_dim=n_hid, out_dim=n_hid, 
+                    num_types=len(self.node_type_mapping),
+                    num_edge_types=num_edge_relations,
+                    n_heads=n_heads,
+                    dropout=dropout,
+                    use_norm=use_norm
+                )
+            )
+
+
+        self.to_mu     = nn.Linear(n_hid, n_hid)
         self.to_logvar = nn.Linear(n_hid, n_hid)
-        
-        # Decoders
         self.decoders = nn.ModuleDict()
-        for k in ["rna", "methylation", "snp"]:
-            sp = source_params[k]
-            self.decoders[k] = _build_mlp(n_hid, list(reversed(sp.get("hidden_dims", []))), sp["input_dim"], dropout)
+        for omics_key in ["rna", "methylation", "snp"]:
+            sp = source_params[omics_key]
+            out_dim = int(sp["input_dim"])
+            hid_rev = list(reversed(sp.get("hidden_dims", [])))
+            self.decoders[omics_key] = _build_mlp(
+                in_dim=n_hid,
+                hidden_dims=hid_rev,
+                out_dim=out_dim,
+                dropout=dropout,
+                last_act=False
+            )
 
-    def encode(self, omics_data, node_type):
-        device = node_type.device
-        h = torch.zeros((node_type.size(0), self.n_hid), device=device)
-        for k, mod in self.encoders.items():
-            if k in omics_data and omics_data[k].numel() > 0:
-                idx = torch.nonzero(node_type == self.type_ids[k], as_tuple=True)[0]
-                h[idx] = mod(omics_data[k])
-        return h
+    @torch.no_grad()
+    def _indices_of_type(self, node_type_tensor: torch.Tensor, type_id: int) -> torch.Tensor:
+        return torch.nonzero(node_type_tensor == type_id, as_tuple=False).squeeze(1)
 
-    def reparameterize(self, mu, logvar):
+    def encode_omics(self, omics_data: dict, node_type_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        omics_data: {'rna': [Nr, Din_rna], 'methylation': [Nm, Din_met], 'snp': [Ns, Din_snp]}
+        """
+        device = node_type_tensor.device
+        N = node_type_tensor.size(0)
+        h0 = torch.zeros((N, self.n_hid), device=device)
+
+        # RNA
+        if "rna" in omics_data and omics_data["rna"].numel() > 0:
+            idx = self._indices_of_type(node_type_tensor, self.type_ids["rna"])
+            x = omics_data["rna"]
+            assert x.size(0) == idx.numel(), f"RNA 行数({x.size(0)})必须等于 RNA 节点数({idx.numel()})"
+            h0[idx] = self.encoders["rna"](x)
+
+        # METH
+        if "methylation" in omics_data and omics_data["methylation"].numel() > 0:
+            idx = self._indices_of_type(node_type_tensor, self.type_ids["methylation"])
+            x = omics_data["methylation"]
+            assert x.size(0) == idx.numel(), f"METH 行数({x.size(0)})必须等于 METH 节点数({idx.numel()})"
+            h0[idx] = self.encoders["methylation"](x)
+
+        # SNP
+        if "snp" in omics_data and omics_data["snp"].numel() > 0:
+            idx = self._indices_of_type(node_type_tensor, self.type_ids["snp"])
+            x = omics_data["snp"]
+            assert x.size(0) == idx.numel(), f"SNP 行数({x.size(0)})必须等于 SNP 节点数({idx.numel()})"
+            h0[idx] = self.encoders["snp"](x)
+
+        return h0
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         std = torch.exp(0.5 * logvar)
-        return mu + torch.randn_like(std) * std
+        eps = torch.randn_like(std)
+        return mu + eps * std
 
-    def forward(self, omics_data, node_type, edge_index, edge_type, edge_sign):
-        # 1. MLP Encode
-        h = self.encode(omics_data, node_type)
-        
-        # 2. HGT Message Passing
-        for layer in self.hgt_layers:
-            h = layer(h, node_type, edge_index, edge_type, edge_sign)
-        
-        # 3. VAE Latent
+    def decode_omics(self, z: torch.Tensor, node_type_tensor: torch.Tensor) -> dict:
+
+        out = {}
+        # RNA
+        idx = self._indices_of_type(node_type_tensor, self.type_ids["rna"])
+        out["rna"] = self.decoders["rna"](z[idx]) if idx.numel() > 0 else torch.empty(0, self.decoders["rna"][-1].out_features, device=z.device)
+        # METH
+        idx = self._indices_of_type(node_type_tensor, self.type_ids["methylation"])
+        out["methylation"] = self.decoders["methylation"](z[idx]) if idx.numel() > 0 else torch.empty(0, self.decoders["methylation"][-1].out_features, device=z.device)
+        # SNP
+        idx = self._indices_of_type(node_type_tensor, self.type_ids["snp"])
+        out["snp"] = self.decoders["snp"](z[idx]) if idx.numel() > 0 else torch.empty(0, self.decoders["snp"][-1].out_features, device=z.device)
+        return out
+
+    def forward(self,
+                omics_data: dict,
+                node_type_tensor: torch.Tensor,
+                edge_index: torch.Tensor,
+                edge_type: torch.Tensor,
+                edge_weights: torch.Tensor,
+                edge_sign: torch.Tensor,
+                edge_distance: torch.Tensor,
+                kl_beta: float,
+                logger=None,
+                epoch: int = 0):
+   
+        h0 = self.encode_omics(omics_data, node_type_tensor)  # [N, n_hid]
+        h = h0  
+        if edge_index is not None and edge_index.numel() > 0: 
+            for layer_idx, hgt_layer in enumerate(self.hgt_layers_list, start=1):
+                h = hgt_layer(
+                    node_inp=h,
+                    node_type=node_type_tensor,
+                    edge_index=edge_index,
+                    edge_type=edge_type,
+                    edge_weights=edge_weights,
+                    edge_sign=edge_sign,
+                    edge_distance=edge_distance,
+                )
         mu, logvar = self.to_mu(h), self.to_logvar(h)
         z = self.reparameterize(mu, logvar)
-        
-        # 4. Decode
-        recon = {}
-        for k, mod in self.decoders.items():
-            idx = torch.nonzero(node_type == self.type_ids[k], as_tuple=True)[0]
-            if idx.numel() > 0:
-                recon[k] = mod(z[idx])
-            else:
-                recon[k] = torch.empty(0, device=z.device)
-        
-        kl = (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(1)).mean()
-        return z, recon, kl
+        kl = (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1)).mean()
 
-# ============================== Main Model ==============================
+        recon = self.decode_omics(z, node_type_tensor)
+        latent_dict = {"z": z}
+        stats = {"z": z, "kl": kl}
+        return latent_dict, recon, stats
+
 
 class PoplarCrossOmicsModel(nn.Module):
-    def __init__(self, source_params, node_type_mapping, edge_type_mapping,
-                 n_hid=64, n_heads=4, dropout=0.2, use_norm=True,
-                 adv_weight=0.2, mmd_weight=0.1, adv_lambda=1.0, hgt_layers=2):
+    def __init__(self,
+                 source_params: Dict[str, Dict],
+                 node_type_mapping: Dict[str, int],
+                 edge_type_mapping: Dict[str, int],
+                 n_hid: int = 64,
+                 n_heads: int = 4,
+                 dropout: float = 0.2,
+                 use_norm: bool = True,
+                 adv_weight: float = 0.2,
+                 mmd_weight: float = 0.1,
+                 adv_lambda: float = 1.0,
+                 hgt_layers: int = 2  
+                 ):
         super().__init__()
         self.node_type_mapping = node_type_mapping
         self.edge_type_mapping = edge_type_mapping
-        
-        self.vae = GraphVAEWithHGT(source_params, node_type_mapping, len(edge_type_mapping), 
-                                   n_hid, n_heads, dropout, use_norm, hgt_layers)
-        
-        self.mmd = MMDLoss()
-        self.domain_adv = DomainAdversary(n_hid, len(node_type_mapping), 128, dropout)
-        
+        self.num_node_types = len(node_type_mapping)
+        self.num_edge_relations = len(edge_type_mapping)
+
+        self.graph_vae = GraphVAEWithHGT(
+            source_params=source_params,
+            node_type_mapping=self.node_type_mapping,
+            num_edge_relations=self.num_edge_relations,
+            n_hid=n_hid, 
+            n_heads=n_heads,
+            dropout=dropout, 
+            use_norm=use_norm,
+            hgt_layers=hgt_layers  
+        )
+
+        self.mmd = MMDLoss([1,2,4,8,16])   
+        self.domain_adv = DomainAdversary(in_dim=n_hid, num_domains=self.num_node_types, hid=128, dropout=dropout)
         self.adv_weight = adv_weight
         self.mmd_weight = mmd_weight
         self.adv_lambda = adv_lambda
-        
-        # KL Annealing params
-        self.kl_start, self.kl_end, self.kl_warmup = 0.0, 1.0, 300
+        self.kl_beta_start, self.kl_beta_end, self.kl_warmup_epochs = 0.0, 1.0, 10
+        self.apply(init_weights)
 
-    def compute_kl_beta(self, epoch):
-        if epoch < self.kl_warmup:
-            return self.kl_start + (self.kl_end - self.kl_start) * (epoch / self.kl_warmup)
-        return self.kl_end
 
-    def forward(self, omics_data_dict, edge_indices_dict, edge_weights_dict, edge_signs_dict, node_type_tensor, epoch=0):
+    def compute_kl_beta(self, epoch: int) -> float:
+        if epoch < self.kl_warmup_epochs:
+            r = epoch / max(1, self.kl_warmup_epochs)
+            return self.kl_beta_start + (self.kl_beta_end - self.kl_beta_start) * r
+        return self.kl_beta_end
+
+    def forward(self,
+                omics_data_dict: Dict[str, torch.Tensor],
+                edge_indices_dict: Dict[str, torch.Tensor],
+                edge_weights_dict: Dict[str, torch.Tensor],
+                edge_signs_dict: Dict[str, torch.Tensor],
+                node_type_tensor: torch.Tensor,  # [N]
+                all_nodes_ordered: Optional[List[Tuple[str, str]]] = None,
+                epoch: int = 0,
+                logger: Optional[logging.Logger] = None,
+                return_post_hoc: bool = False):
         device = node_type_tensor.device
 
-        # 1. Aggregate Edges
-        all_e, all_t, all_s = [], [], []
-        for rel, rid in self.edge_type_mapping.items():
-            if rel in edge_indices_dict and edge_indices_dict[rel].numel() > 0:
-                e = edge_indices_dict[rel]
-                all_e.append(e)
-                all_t.append(torch.full((e.size(1),), rid, device=device))
-                
-                s = edge_signs_dict.get(rel, torch.full((e.size(1),), -2, device=device))
-                all_s.append(s)
-
-        if all_e:
-            edge_index = torch.cat(all_e, dim=1)
-            edge_type = torch.cat(all_t)
-            edge_sign = torch.cat(all_s)
+        all_edges, all_types, all_weights, all_signs = [], [], [], []
+        for rel_name, rel_id in self.edge_type_mapping.items():
+            eidx = edge_indices_dict.get(rel_name, None)
+            if eidx is None or eidx.numel() == 0:
+                continue
+            E_r = eidx.size(1)
+            all_edges.append(eidx.to(device))
+            all_types.append(torch.full((E_r,), rel_id, dtype=torch.long, device=device))
+            w = edge_weights_dict.get(rel_name, torch.ones(E_r, device=device))
+            all_weights.append(w.to(device))
+            if rel_name in edge_signs_dict and edge_signs_dict[rel_name] is not None:
+                s = edge_signs_dict[rel_name].to(device)
+            else:
+                s = torch.full((E_r,), -2, dtype=torch.long, device=device)
+            s = torch.where(s < -1, torch.full_like(s, -2),
+                            torch.where(s == 0, torch.full_like(s, -2), s.clamp(-1, 1)))
+            all_signs.append(s)
+        if len(all_edges) == 0:
+            edge_index = torch.empty(2, 0, dtype=torch.long, device=device)
+            edge_type  = torch.empty(0, dtype=torch.long, device=device)
+            edge_w     = torch.empty(0, device=device)
+            edge_s     = torch.empty(0, dtype=torch.long, device=device)
         else:
-            edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
-            edge_type = torch.empty(0, dtype=torch.long, device=device)
-            edge_sign = torch.empty(0, dtype=torch.long, device=device)
+            edge_index = torch.cat(all_edges, dim=1)
+            edge_type  = torch.cat(all_types, dim=0)
+            edge_w     = torch.cat(all_weights, dim=0)
+            edge_s     = torch.cat(all_signs,  dim=0)
 
-        # 2. VAE Forward
-        z, recon, kl_raw = self.vae(omics_data_dict, node_type_tensor, edge_index, edge_type, edge_sign)
-        
-        # 3. Loss Calculation
-        # Reconstruction
-        recon_loss = 0.0
-        for k in recon:
-            if recon[k].numel() > 0:
-                recon_loss += F.mse_loss(recon[k], omics_data_dict[k])
-        
-        # KL Divergence
         kl_beta = self.compute_kl_beta(epoch)
-        
-        # Adversarial Loss
+        latent_dict, recon_dict, vae_stats = self.graph_vae(
+            omics_data=omics_data_dict,
+            node_type_tensor=node_type_tensor,
+            edge_index=edge_index, edge_type=edge_type,
+            edge_weights=edge_w, edge_sign=edge_s,
+            edge_distance=None,
+            kl_beta=kl_beta, logger=logger, epoch=epoch
+        )
+
+        recon_loss = 0.0
+        recon_per_omics = {}
+        for source in ["snp", "methylation", "rna"]:
+            if source in recon_dict and source in omics_data_dict and omics_data_dict[source].numel() > 0:
+                l = F.mse_loss(recon_dict[source], omics_data_dict[source])
+                recon_per_omics[source] = l; recon_loss += l
+            else:
+                recon_per_omics[source] = torch.tensor(0.0, device=device)
+        kl_loss = vae_stats["kl"]
+        loss = recon_loss + kl_beta * kl_loss
+
+
         adv_loss = torch.tensor(0.0, device=device)
-        if self.adv_weight > 0:
-            dom_pred = self.domain_adv(z, self.adv_lambda)
-            adv_loss = F.cross_entropy(dom_pred, node_type_tensor)
+        current_emb = vae_stats["z"]  
+        if self.adv_weight > 0.0 and self.domain_adv is not None:
+            dom_logits = self.domain_adv(current_emb, lambd=self.adv_lambda)
+            targets = node_type_tensor.to(dom_logits.device, non_blocking=True)
+            adv_loss = F.cross_entropy(dom_logits, targets)
+            loss = loss + self.adv_weight * adv_loss
 
-        # MMD Loss (Align SNP/METH to RNA)
-        mmd_loss = torch.tensor(0.0, device=device)
-        if self.mmd_weight > 0:
-            rna_mask = (node_type_tensor == self.node_type_mapping['RNA'])
-            snp_mask = (node_type_tensor == self.node_type_mapping['SNP'])
-            meth_mask = (node_type_tensor == self.node_type_mapping['METH'])
-            
-            if rna_mask.any() and snp_mask.any():
-                mmd_loss += self.mmd(z[snp_mask], z[rna_mask])
-            if rna_mask.any() and meth_mask.any():
-                mmd_loss += self.mmd(z[meth_mask], z[rna_mask])
+        z_snp = current_emb[(node_type_tensor == self.node_type_mapping["SNP"])]
+        z_met = current_emb[(node_type_tensor == self.node_type_mapping["METH"])]
+        z_rna = current_emb[(node_type_tensor == self.node_type_mapping["RNA"])]
+        mmd_sr, _ = self.mmd(z_snp, z_rna)
+        mmd_mr, _ = self.mmd(z_met, z_rna)
 
-        # Total Loss
-        total_loss = recon_loss + (kl_beta * kl_raw) + (self.adv_weight * adv_loss) + (self.mmd_weight * mmd_loss)
+        mmd_loss = mmd_sr + mmd_mr
+        loss = loss + self.mmd_weight* mmd_loss
 
-        return {
-            'node_out': z,
-            'loss_dict': {
-                'total_loss': total_loss,
-                'reconstruction_loss': recon_loss,
-                'kl_loss': kl_raw,
-                'adv_loss': adv_loss,
-                'mmd_loss': mmd_loss
-            }
+        loss_dict = {
+            "total_loss": loss,
+            "reconstruction_loss": recon_loss,
+            "recon_rna": recon_per_omics["rna"],
+            "recon_methylation": recon_per_omics["methylation"],
+            "recon_snp": recon_per_omics["snp"],
+            "kl_loss": kl_loss,
+            "mmd_loss": mmd_loss,
+            "adv_loss": adv_loss if self.adv_weight > 0 else torch.tensor(0.0, device=device)
         }
+        outputs = {
+            "loss_dict": loss_dict,
+            "node_emb": current_emb.detach(),  
+            "node_out": current_emb.detach(), 
+        }
+        if return_post_hoc:
+            outputs["post_hoc_scores"] = self.compute_post_hoc_edge_scores(current_emb, edge_indices_dict)
+        return outputs
+
+    @torch.no_grad()
+    def compute_post_hoc_edge_scores(self, node_emb: torch.Tensor, edge_indices_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        z = F.normalize(node_emb, p=2, dim=-1)
+        post = {}
+        for rel_name, eidx in edge_indices_dict.items():
+            if eidx is None or eidx.numel() == 0:
+                post[rel_name] = torch.empty(0, device=node_emb.device); continue
+            post[rel_name] = (z[eidx[0]] * z[eidx[1]]).sum(-1)
+        return post
