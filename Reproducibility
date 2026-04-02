@@ -1,0 +1,37 @@
+This document describes the hardware environment, runtime configuration, random seed settings, and reporting protocol used for reproducing the main results of PoplarCrossOmics.
+
+1. Hardware configuration
+
+The main experiments reported in the manuscript were conducted on the following hardware:
+
+- GPU: NVIDIA GeForce RTX 4090
+- GPU memory: 24 GB VRAM
+- CUDA: 12.8
+- CPU: A standard multi-core x86_64 workstation/server CPU is sufficient for preprocessing and training orchestration
+- System memory (recommended): at least 32 GB RAM
+
+In our setting, GPU memory usage was well within the 24 GB capacity of the RTX 4090 for the full training procedure.
+
+2. Training time
+
+For the main experiment setting:
+
+- Training epochs: 300
+- Approximate wall-clock time: ~7 minutes on a single NVIDIA GeForce RTX 4090 (24 GB VRAM)
+
+The exact runtime may vary depending on CPU speed, storage I/O, PyTorch/CUDA build, and background GPU load.
+
+3. Random seeds and stochastic components
+
+To improve reproducibility, the implementation fixes the random seeds for the major stochastic components used during training and data preparation.
+
+ 3.1 Fixed random seed
+
+The default random seed is:
+
+- seed = 42
+
+This value is exposed in the training script as:
+
+
+python run.py --gpu 0 --epochs 300 --lr 1e-3 --seed 42
