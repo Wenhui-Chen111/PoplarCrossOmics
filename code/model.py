@@ -396,21 +396,21 @@ class GraphVAEWithHGT(nn.Module):
         if "rna" in omics_data and omics_data["rna"].numel() > 0:
             idx = self._indices_of_type(node_type_tensor, self.type_ids["rna"])
             x = omics_data["rna"]
-            assert x.size(0) == idx.numel(), f"RNA 行数({x.size(0)})必须等于 RNA 节点数({idx.numel()})"
+            assert x.size(0) == idx.numel(), f"RNA rows ({x.size(0)}) must equal RNA node count ({idx.numel()})"
             h0[idx] = self.encoders["rna"](x)
 
         # METH
         if "methylation" in omics_data and omics_data["methylation"].numel() > 0:
             idx = self._indices_of_type(node_type_tensor, self.type_ids["methylation"])
             x = omics_data["methylation"]
-            assert x.size(0) == idx.numel(), f"METH 行数({x.size(0)})必须等于 METH 节点数({idx.numel()})"
+            assert x.size(0) == idx.numel(), f"METH rows ({x.size(0)}) must equal METH node count ({idx.numel()})"
             h0[idx] = self.encoders["methylation"](x)
 
         # SNP
         if "snp" in omics_data and omics_data["snp"].numel() > 0:
             idx = self._indices_of_type(node_type_tensor, self.type_ids["snp"])
             x = omics_data["snp"]
-            assert x.size(0) == idx.numel(), f"SNP 行数({x.size(0)})必须等于 SNP 节点数({idx.numel()})"
+            assert x.size(0) == idx.numel(), f"SNP rows ({x.size(0)}) must equal SNP node count ({idx.numel()})"
             h0[idx] = self.encoders["snp"](x)
 
         return h0
